@@ -7,34 +7,28 @@
 # ----------------------------------------------
 
 # Imports
-import numpy as np
+import asyncio
+import base64
 import os
-import six.moves.urllib as urllib
-import sys
-import tarfile
-import tensorflow as tf
-import zipfile
+from typing import Union
+
+import tensorflow.compat.v1 as tf
+from gql import Client, gql
+from gql.transport.requests import RequestsHTTPTransport
+
+tf.disable_v2_behavior()
 import cv2
 import numpy as np
 import csv
-import time
+
+from hyperlpr import HyperLPR_plate_recognition
 from packaging import version
 
-from collections import defaultdict
-from io import StringIO
-from matplotlib import pyplot as plt
-from PIL import Image
-
 # Object detection imports
+from model.Vehicle import Vehicle
+from gql.transport.aiohttp import AIOHTTPTransport
 from utils import label_map_util
 from utils import visualization_utils as vis_util
-
-# initialize .csv
-with open('traffic_measurement.csv', 'w') as f:
-    writer = csv.writer(f)
-    csv_line = \
-        'Vehicle Type/Size, Vehicle Color, Vehicle Movement Direction, Vehicle Speed (km/h)'
-    writer.writerows([csv_line.split(',')])
 
 if version.parse(tf.__version__) < version.parse('1.4.0'):
     raise ImportError('Please upgrade your tensorflow installation to v1.4.* or later!'
@@ -42,9 +36,6 @@ if version.parse(tf.__version__) < version.parse('1.4.0'):
 
 # input video
 cap = cv2.VideoCapture('sub-1504619634606.mp4')
-
-# Variables
-total_passed_vehicle = 0  # using it to count vehicles
 
 # By default I use an "SSD with Mobilenet" model here. See the detection model zoo (https://github.com/tensorflow/models/blob/master/research/object_detection/g3doc/detection_model_zoo.md) for a list of other models that can be run out-of-the-box with varying speeds and accuracies.
 # What model to download.
@@ -76,7 +67,7 @@ with detection_graph.as_default():
 # Label maps map indices to category names, so that when our convolution network predicts 5, we know that this corresponds to airplane. Here I use internal utility functions, but anything that returns a dictionary mapping integers to appropriate string labels would be fine
 label_map = label_map_util.load_labelmap(PATH_TO_LABELS)
 categories = label_map_util.convert_label_map_to_categories(label_map,
-        max_num_classes=NUM_CLASSES, use_display_name=True)
+                                                            max_num_classes=NUM_CLASSES, use_display_name=True)
 category_index = label_map_util.create_category_index(categories)
 
 
@@ -84,16 +75,122 @@ category_index = label_map_util.create_category_index(categories)
 def load_image_into_numpy_array(image):
     (im_width, im_height) = image.size
     return np.array(image.getdata()).reshape((im_height, im_width,
-            3)).astype(np.uint8)
+                                              3)).astype(np.uint8)
+
+
+def draw_roi(counter, frame, pos) -> None:
+    if counter == 1:
+        cv2.line(frame, (0, pos), (640, pos), (0, 0xFF, 0), 5)
+    else:
+        cv2.line(frame, (0, pos), (640, pos), (0, 0, 0xFF), 5)
+    cv2.putText(
+        frame,
+        'ROI Line',
+        (545, pos - 10),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (0, 0, 0xFF),
+        2,
+        cv2.LINE_AA, )
+
+
+def draw_info(frame, vehicle: Vehicle) -> None:
+    if vehicle is None:
+        return
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    cv2.rectangle(frame, (10, 275), (230, 337), (180, 132, 109), -1)
+
+    cv2.putText(
+        frame,
+        'LAST PASSED VEHICLE INFO',
+        (11, 290),
+        font,
+        0.5,
+        (0xFF, 0xFF, 0xFF),
+        1,
+        cv2.FONT_HERSHEY_SIMPLEX,
+    )
+    cv2.putText(
+        frame,
+        '-Movement Direction: ' + vehicle.direction,
+        (14, 302),
+        font,
+        0.4,
+        (0xFF, 0xFF, 0xFF),
+        1,
+        cv2.FONT_HERSHEY_COMPLEX_SMALL,
+    )
+    cv2.putText(
+        frame,
+        '-Speed(km/h): ' + str(vehicle.speed),
+        (14, 312),
+        font,
+        0.4,
+        (0xFF, 0xFF, 0xFF),
+        1,
+        cv2.FONT_HERSHEY_COMPLEX_SMALL,
+    )
+    cv2.putText(
+        frame,
+        '-Color: ' + vehicle.color,
+        (14, 322),
+        font,
+        0.4,
+        (0xFF, 0xFF, 0xFF),
+        1,
+        cv2.FONT_HERSHEY_COMPLEX_SMALL,
+    )
+
+
+def license_plate_recognition(vehicle):
+    vehicle.license_plate = HyperLPR_plate_recognition(vehicle.image)
+
+
+def draw_total_count(frame, total_passed_vehicle):
+    cv2.putText(
+        frame,
+        'Detected Vehicles: ' + str(total_passed_vehicle),
+        (10, 35),
+        cv2.FONT_HERSHEY_SIMPLEX
+        ,
+        0.8,
+        (0, 0xFF, 0xFF),
+        2,
+        cv2.FONT_HERSHEY_SIMPLEX
+    )
+
+
+backend_transport = RequestsHTTPTransport(
+    url='http://10.0.0.235:8080/graphql',
+    headers={'Authorization': 'token'}
+)
+
+
+def dispatch_vehicle(vehicle: Vehicle):
+    with Client(
+            transport=backend_transport,
+            fetch_schema_from_transport=True,
+    ) as session:
+        vehicle.image = base64.b64encode(cv2.imencode('.jpg', vehicle.image)[1])
+
+        session.execute(gql('''
+            query{
+                fuckCrossroad(vehicle: {
+                image:"'''+vehicle.image.decode('utf-8')+'''",
+                licensePlate: '''+'null'+''',
+                color: "'''+vehicle.color+'''",
+                speed: '''+str(vehicle.speed)+'''
+            }){
+                    licensePlate
+                }
+            }
+            '''))
 
 
 # Detection
-def object_detection_function():
+def object_detection_function() -> None:
+    prev_vehicle: Union[Vehicle, None] = None
     total_passed_vehicle = 0
-    speed = 'waiting...'
-    direction = 'waiting...'
-    size = 'waiting...'
-    color = 'waiting...'
     with detection_graph.as_default():
         with tf.Session(graph=detection_graph) as sess:
 
@@ -114,7 +211,7 @@ def object_detection_function():
                 (ret, frame) = cap.read()
 
                 if not ret:
-                    print ('end of the video file...')
+                    print('end of the video file...')
                     break
 
                 input_frame = frame
@@ -125,119 +222,47 @@ def object_detection_function():
                 # Actual detection.
                 (boxes, scores, classes, num) = \
                     sess.run([detection_boxes, detection_scores,
-                             detection_classes, num_detections],
+                              detection_classes, num_detections],
                              feed_dict={image_tensor: image_np_expanded})
 
                 # Visualization of the results of a detection.
-                (counter, csv_line) = \
+                (counter, csv_line, vehicle) = \
                     vis_util.visualize_boxes_and_labels_on_image_array(
-                    cap.get(1),
-                    input_frame,
-                    np.squeeze(boxes),
-                    np.squeeze(classes).astype(np.int32),
-                    np.squeeze(scores),
-                    category_index,
-                    use_normalized_coordinates=True,
-                    line_thickness=4,
+                        cap.get(1),
+                        input_frame,
+                        np.squeeze(boxes),
+                        np.squeeze(classes).astype(np.int32),
+                        np.squeeze(scores),
+                        category_index,
+                        use_normalized_coordinates=True,
+                        line_thickness=4, roi_position=200
                     )
 
                 total_passed_vehicle = total_passed_vehicle + counter
-
+                if vehicle is not None:
+                    vehicle.image = input_frame[int(vehicle.image["top"] * input_frame.shape[0]):int(
+                        vehicle.image["bottom"] * input_frame.shape[0]),
+                                    int(vehicle.image["left"] * input_frame.shape[1]):int(
+                                        vehicle.image["right"] * input_frame.shape[1])]
+                    license_plate_recognition(vehicle)
+                    dispatch_vehicle(vehicle)
                 # insert information text to video frame
-                font = cv2.FONT_HERSHEY_SIMPLEX
-                cv2.putText(
-                    input_frame,
-                    'Detected Vehicles: ' + str(total_passed_vehicle),
-                    (10, 35),
-                    font,
-                    0.8,
-                    (0, 0xFF, 0xFF),
-                    2,
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    )
+                draw_total_count(input_frame, total_passed_vehicle)
 
-                # when the vehicle passed over line and counted, make the color of ROI line green
-                if counter == 1:
-                    cv2.line(input_frame, (0, 200), (640, 200), (0, 0xFF, 0), 5)
+                draw_roi(counter, input_frame, 200)
+                if vehicle is not None:
+                    draw_info(input_frame, vehicle)
+                    prev_vehicle = vehicle
                 else:
-                    cv2.line(input_frame, (0, 200), (640, 200), (0, 0, 0xFF), 5)
-
-                # insert information text to video frame
-                cv2.rectangle(input_frame, (10, 275), (230, 337), (180, 132, 109), -1)
-                cv2.putText(
-                    input_frame,
-                    'ROI Line',
-                    (545, 190),
-                    font,
-                    0.6,
-                    (0, 0, 0xFF),
-                    2,
-                    cv2.LINE_AA,
-                    )
-                cv2.putText(
-                    input_frame,
-                    'LAST PASSED VEHICLE INFO',
-                    (11, 290),
-                    font,
-                    0.5,
-                    (0xFF, 0xFF, 0xFF),
-                    1,
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    )
-                cv2.putText(
-                    input_frame,
-                    '-Movement Direction: ' + direction,
-                    (14, 302),
-                    font,
-                    0.4,
-                    (0xFF, 0xFF, 0xFF),
-                    1,
-                    cv2.FONT_HERSHEY_COMPLEX_SMALL,
-                    )
-                cv2.putText(
-                    input_frame,
-                    '-Speed(km/h): ' + speed,
-                    (14, 312),
-                    font,
-                    0.4,
-                    (0xFF, 0xFF, 0xFF),
-                    1,
-                    cv2.FONT_HERSHEY_COMPLEX_SMALL,
-                    )
-                cv2.putText(
-                    input_frame,
-                    '-Color: ' + color,
-                    (14, 322),
-                    font,
-                    0.4,
-                    (0xFF, 0xFF, 0xFF),
-                    1,
-                    cv2.FONT_HERSHEY_COMPLEX_SMALL,
-                    )
-                cv2.putText(
-                    input_frame,
-                    '-Vehicle Size/Type: ' + size,
-                    (14, 332),
-                    font,
-                    0.4,
-                    (0xFF, 0xFF, 0xFF),
-                    1,
-                    cv2.FONT_HERSHEY_COMPLEX_SMALL,
-                    )
+                    draw_info(input_frame, prev_vehicle)
 
                 cv2.imshow('vehicle detection', input_frame)
 
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     break
 
-                if csv_line != 'not_available':
-                    with open('traffic_measurement.csv', 'a') as f:
-                        writer = csv.writer(f)
-                        (size, color, direction, speed) = \
-                            csv_line.split(',')
-                        writer.writerows([csv_line.split(',')])
             cap.release()
             cv2.destroyAllWindows()
 
 
-object_detection_function()		
+object_detection_function()
