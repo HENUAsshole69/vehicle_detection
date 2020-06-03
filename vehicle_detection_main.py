@@ -9,6 +9,7 @@
 # Imports
 import asyncio
 import base64
+import concurrent.futures
 import os
 from typing import Union
 
@@ -176,10 +177,10 @@ def dispatch_vehicle(vehicle: Vehicle):
         session.execute(gql('''
             query{
                 fuckCrossroad(vehicle: {
-                image:"'''+vehicle.image.decode('utf-8')+'''",
-                licensePlate: '''+'null'+''',
-                color: "'''+vehicle.color+'''",
-                speed: '''+str(vehicle.speed)+'''
+                image:"''' + vehicle.image.decode('utf-8') + '''",
+                licensePlate: ''' + 'null' + ''',
+                color: "''' + vehicle.color + '''",
+                speed: ''' + str(vehicle.speed) + '''
             }){
                     licensePlate
                 }
@@ -187,8 +188,11 @@ def dispatch_vehicle(vehicle: Vehicle):
             '''))
 
 
+network_pool = concurrent.futures.ThreadPoolExecutor()
+
+
 # Detection
-def object_detection_function() -> None:
+async def object_detection_function() -> None:
     prev_vehicle: Union[Vehicle, None] = None
     total_passed_vehicle = 0
     with detection_graph.as_default():
@@ -245,7 +249,7 @@ def object_detection_function() -> None:
                                     int(vehicle.image["left"] * input_frame.shape[1]):int(
                                         vehicle.image["right"] * input_frame.shape[1])]
                     license_plate_recognition(vehicle)
-                    dispatch_vehicle(vehicle)
+                    asyncio.get_running_loop().run_in_executor(network_pool, lambda: dispatch_vehicle(vehicle))
                 # insert information text to video frame
                 draw_total_count(input_frame, total_passed_vehicle)
 
@@ -265,4 +269,4 @@ def object_detection_function() -> None:
             cv2.destroyAllWindows()
 
 
-object_detection_function()
+asyncio.run(object_detection_function())
